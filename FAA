@@ -1,0 +1,121 @@
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from scipy.signal import welch
+from brainflow.board_shim import BoardShim, BrainFlowInputParams, BoardIds
+from pylsl import StreamInfo, StreamOutlet
+from scipy.signal import butter, filtfilt
+
+
+# === CONFIGURATION ===
+board_id = BoardIds.CYTON_BOARD.value  # or GANGLION_BOARD.value
+serial_port = 'COM3'           # Change as needed for your OS
+
+params = BrainFlowInputParams()
+params.serial_port = serial_port
+
+board = BoardShim(board_id, params)
+BoardShim.enable_dev_board_logger()
+board.prepare_session()
+board.start_stream()
+
+eeg_channels = BoardShim.get_eeg_channels(board_id)
+fs = BoardShim.get_sampling_rate(board_id)
+window_duration = 1  # seconds
+step_duration = 0.2  # seconds
+window_size = int(fs * window_duration)
+step_size = int(fs * step_duration)
+
+FP1_idx = eeg_channels[2]  # adjust to your electrode placement
+FP2_idx = eeg_channels[3]
+
+# === LSL Setup ===
+info = StreamInfo('OpenBCI_EEG', 'EEG', len(eeg_channels), fs, 'float32', 'openbci1234')
+outlet = StreamOutlet(info)
+
+# === Buffers for plotting ===
+buffer_length = 100  # number of FAA values to keep for display (~20 seconds if step=0.2s)
+faa_history = []
+time_history = []
+
+fp1_plot_buffer = np.zeros(window_size)
+fp2_plot_buffer = np.zeros(window_size)
+
+# === Plot setup ===
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6))
+line_fp1, = ax1.plot([], [], label='FP1', color='blue')
+line_fp2, = ax1.plot([], [], label='FP2', color='red')
+ax1.set_ylim(-200, 200)  # Adjust if needed
+ax1.set_title("EEG Signals (Last 1 Second)")
+ax1.legend()
+
+line_faa, = ax2.plot([], [], label='FAA', color='purple')
+ax2.set_ylim(-2, 2)
+ax2.set_title("Frontal Alpha Asymmetry Over Time")
+ax2.set_xlabel("Time (s)")
+ax2.legend()
+
+start_time = time.time()
+
+def get_alpha_power(signal):
+    f, Pxx = welch(signal, fs=fs, nperseg=len(signal))
+    alpha_band = (f >= 8) & (f <= 13)
+    return np.mean(Pxx[alpha_band])
+
+def update_plot(frame):
+    global fp1_plot_buffer, fp2_plot_buffer
+
+    data = board.get_current_board_data(window_size)
+    if data.shape[1] < window_size:
+        return line_fp1, line_fp2, line_faa
+
+    for i in range(data.shape[1]):
+        outlet.push_sample(data[eeg_channels, i].tolist())
+
+    fp1_data = data[FP1_idx]
+    fp2_data = data[FP2_idx]
+
+    fp1_data = fp1_data * 0.02235  # Cyton scale to µV
+    fp2_data = fp2_data * 0.02235  # Cyton scale to µV
+
+    def highpass_filter(data, fs, cutoff=1.0):
+        b, a = butter(2, cutoff / (fs / 2), btype='high')
+        return filtfilt(b, a, data)
+
+    fp1_data_filtered = highpass_filter(fp1_data, fs)
+    fp2_data_filtered = highpass_filter(fp2_data, fs)
+
+    fp1_plot_buffer = fp1_data_filtered
+    fp2_plot_buffer = fp2_data_filtered
+
+    fp1_alpha = get_alpha_power(fp1_data_filtered)
+    fp2_alpha = get_alpha_power(fp2_data_filtered)
+    faa = np.log(fp2_alpha) - np.log(fp1_alpha)
+
+    # Update FAA history
+    faa_history.append(faa)
+    time_history.append(time.time() - start_time)
+
+    # If you want to keep buffer_length, pop old samples but keep timestamps consistent:
+    if len(faa_history) > buffer_length:
+        faa_history.pop(0)
+        time_history.pop(0)
+
+    # === Update plots ===
+    line_fp1.set_data(np.linspace(0, window_duration, window_size), fp1_plot_buffer)
+    line_fp2.set_data(np.linspace(0, window_duration, window_size), fp2_plot_buffer)
+    ax1.set_xlim(0, window_duration)
+
+    line_faa.set_data(time_history, faa_history)
+    ax2.set_xlim(time_history[-1] - 20, time_history[-1])  # always show the last 20s
+
+    return line_fp1, line_fp2, line_faa
+
+ani = FuncAnimation(fig, update_plot, interval=step_duration * 1000)
+plt.tight_layout()
+plt.show()
+
+# Stop on close
+board.stop_stream()
+board.release_session()
